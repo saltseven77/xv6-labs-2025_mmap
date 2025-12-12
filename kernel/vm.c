@@ -7,7 +7,9 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "fs.h"
-
+#include "sleeplock.h"
+#include "file.h"
+#include "fcntl.h"
 /*
  * the kernel's page table.
  */
@@ -97,8 +99,11 @@ kvminithart()
 pte_t *
 walk(pagetable_t pagetable, uint64 va, int alloc)
 {
-  if(va >= MAXVA)
-    panic("walk");
+  if(va >= MAXVA) {
+    if (alloc)
+      panic("walk");
+    return 0;
+  }
 
   for(int level = 2; level > 0; level--) {
     pte_t *pte = &pagetable[PX(level, va)];
@@ -384,6 +389,8 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
+    if(va0 >= MAXVA)
+      return -1;
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
       if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
@@ -449,24 +456,75 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 // that was lazily allocated in sys_sbrk().
 // returns 0 if va is invalid or already mapped, or if
 // out of physical memory, and physical address if successful.
+
+// allocate/map a page on fault. Supports
+// - LAB_LAZY: heap lazy allocation (fallback)
+// - LAB_MMAP: file-backed VMA lazy loading and protection
+// returns 0 on failure; physical addr on success.
 uint64
 vmfault(pagetable_t pagetable, uint64 va, int read)
 {
-  uint64 mem;
+  //uint64 mem;
   struct proc *p = myproc();
 
-  if (va >= p->sz)
-    return 0;
+  //if (va >= p->sz)
+    //return 0;
   va = PGROUNDDOWN(va);
   if(ismapped(pagetable, va)) {
     return 0;
   }
-  mem = (uint64) kalloc();
-  if(mem == 0)
+  //mem = (uint64) kalloc();
+  //if(mem == 0)
+#ifdef LAB_MMAP
+  // check VMA regions
+  for (int i = 0; i < MAXVMA; i++) {
+    if (!p->vmas[i].used) continue;
+    uint64 start = p->vmas[i].start;
+    uint64 end = start + p->vmas[i].length;
+    if (va >= start && va < end) {
+      // permission check: if write fault but no PROT_WRITE, or read fault but no PROT_READ
+      if ((!read && (p->vmas[i].prot & PROT_WRITE) == 0) ||
+          ( read && (p->vmas[i].prot & PROT_READ)  == 0)) {
+        return 0;
+      }
+      uint64 pa = (uint64)kalloc();
+      if (pa == 0)
+        return 0;
+      memset((void*)pa, 0, PGSIZE);
+      // load from file if present
+      if (p->vmas[i].f && p->vmas[i].f->type == FD_INODE) {
+        uint64 off_in_map = (va - start);
+        uint file_off = p->vmas[i].off + off_in_map;
+        int nread = 0;
+        begin_op();
+        ilock(p->vmas[i].f->ip);
+        // read up to a page or until EOF
+        nread = readi(p->vmas[i].f->ip, 0, pa, file_off, PGSIZE);
+        iunlock(p->vmas[i].f->ip);
+        end_op();
+        (void)nread;
+      }
+      int perm = PTE_U | PTE_R;
+      if (p->vmas[i].prot & PROT_WRITE)
+        perm |= PTE_W;
+      if (mappages(p->pagetable, va, PGSIZE, pa, perm) != 0) {
+        kfree((void*)pa);
+        return 0;
+      }
+      return pa;
+    }
+  }
+#endif
+
+  // fallback: lazy sbrk region support if within p->sz
+  if (va >= p->sz)
     return 0;
-  memset((void *) mem, 0, PGSIZE);
+  uint64 mem = (uint64)kalloc();
+  if (mem == 0)
+    return 0;
+  memset((void*) mem, 0, PGSIZE);
   if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
-    kfree((void *)mem);
+    kfree((void*)mem);
     return 0;
   }
   return mem;
@@ -475,6 +533,8 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
 int
 ismapped(pagetable_t pagetable, uint64 va)
 {
+  if (va >= MAXVA)
+    return 0;
   pte_t *pte = walk(pagetable, va, 0);
   if (pte == 0) {
     return 0;
@@ -484,3 +544,4 @@ ismapped(pagetable_t pagetable, uint64 va)
   }
   return 0;
 }
+

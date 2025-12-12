@@ -16,6 +16,241 @@
 #include "file.h"
 #include "fcntl.h"
 
+#ifndef __ARGFD_FWD_DECL
+#define __ARGFD_FWD_DECL
+static int argfd(int n, int *pfd, struct file **pf);
+#endif
+
+#ifdef LAB_MMAP
+static struct vma *find_free_vma(struct proc *p)
+{
+  for (int i = 0; i < MAXVMA; i++) {
+    if (!p->vmas[i].used)
+      return &p->vmas[i];
+  }
+  return 0;
+}
+// return 1 if ranges [a0,a0+l0) and [a1,a1+l1) overlap
+static int range_overlap(uint64 a0, uint64 l0, uint64 a1, uint64 l1)
+{
+  uint64 e0 = a0 + l0;
+  uint64 e1 = a1 + l1;
+  return !(e0 <= a1 || e1 <= a0);
+}
+
+// find a free VA range of length "length" starting at or after base,
+// avoiding overlap with existing VMAs. returns 0 on failure.
+static uint64 find_free_range(struct proc *p, uint64 base, uint64 length)
+{
+  uint64 addr = base;
+  if (length == 0)
+    return 0;
+  // highest usable user VA (exclude trapframe & trampoline pages)
+  uint64 upper = MAXVA - 2*PGSIZE;
+  // simple first-fit scan by bumping past overlapping VMAs
+  for (;;) {
+    int overlapped = 0;
+    for (int i = 0; i < MAXVMA; i++) {
+      if (!p->vmas[i].used) continue;
+      uint64 s = p->vmas[i].start;
+      uint64 e = s + p->vmas[i].length;
+      if (range_overlap(addr, length, s, e - s)) {
+        // bump just past this VMA and restart scan
+        addr = e;
+        overlapped = 1;
+        break;
+      }
+    }
+    if (!overlapped)
+      break;
+    // avoid wrapping and extremely large addresses
+    if (addr + length > upper)
+      return 0;
+  }
+  if (addr + length > upper)
+    return 0;
+  return addr;
+}
+static struct vma *find_vma_covering(struct proc *p, uint64 addr, uint64 len)
+{
+  for (int i = 0; i < MAXVMA; i++) {
+    if (!p->vmas[i].used) continue;
+    uint64 start = p->vmas[i].start;
+    uint64 end = start + p->vmas[i].length;
+    if (addr >= start && addr + len <= end)
+      return &p->vmas[i];
+  }
+  return 0;
+}
+
+uint64
+sys_mmap(void)
+{
+  uint64 uaddr;
+  size_t length;
+  int prot, flags, fd;
+  off_t off;
+  struct file *f;
+  struct proc *p = myproc();
+
+  argaddr(0, &uaddr);
+  argaddr(1, (uint64 *)&length);
+  argint(2, &prot);
+  argint(3, &flags);
+  argint(4, &fd);
+  argaddr(5, (uint64 *)&off);
+
+  if (length == 0)
+    return (uint64)-1;
+  // page-align length and require page-aligned offset
+  if (off % PGSIZE)
+    return (uint64)-1;
+  length = PGROUNDUP(length);
+
+  if (argfd(4, 0, &f) < 0)
+    return (uint64)-1;
+
+  // if shared+write, require fd writable
+  if ((flags & MAP_SHARED) && (prot & PROT_WRITE) && !f->writable)
+    return (uint64)-1;
+
+  // pick an address if not provided
+  uint64 addr = uaddr;
+  if (addr == 0) {
+    //addr = PGROUNDUP(p->sz);
+    uint64 base = PGROUNDUP(p->sz);
+    addr = find_free_range(p, base, length);
+    if (addr == 0)
+      return (uint64)-1;
+    // do not change p->sz; keep separate region
+  } else {
+    if (addr % PGSIZE)
+      return (uint64)-1;
+    // bounds check against upper limit
+    uint64 upper = MAXVA - 2*PGSIZE;
+    if (addr + length > upper)
+      return (uint64)-1;
+    // explicit address: reject if overlaps an existing VMA
+    for (int i = 0; i < MAXVMA; i++) {
+      if (!p->vmas[i].used) continue;
+      if (range_overlap(addr, length, p->vmas[i].start, p->vmas[i].length))
+        return (uint64)-1;
+    }  
+}
+
+  struct vma *v = find_free_vma(p);
+  if (v == 0)
+    return (uint64)-1;
+
+  // install VMA
+  v->start = addr;
+  v->length = length;
+  v->prot = prot;
+  v->flags = flags;
+  v->f = filedup(f);
+  v->off = off;
+  v->used = 1;
+
+  return addr;
+}
+
+static int vma_writeback_and_unmap(struct proc *p, struct vma *v, uint64 addr, uint64 len)
+{
+  // writeback for MAP_SHARED & PROT_WRITE
+  int do_wb = (v->flags & MAP_SHARED) && (v->prot & PROT_WRITE);
+  for (uint64 a = addr; a < addr + len; a += PGSIZE) {
+    pte_t *pte = walk(p->pagetable, a, 0);
+    if (pte && (*pte & PTE_V)) {
+      uint64 pa = PTE2PA(*pte);
+      if (do_wb && v->f && v->f->type == FD_INODE) {
+        uint64 off_in_map = (a - v->start);
+        uint file_off = v->off + off_in_map;
+        begin_op();
+        ilock(v->f->ip);
+        //(void) writei(v->f->ip, 0, (uint64)pa, file_off, PGSIZE);
+        // write only the part that fits in the original file size; do not extend file
+        uint fsize = v->f->ip->size;
+        uint n = 0;
+        if (file_off < fsize) {
+          uint rem = fsize - file_off;
+          n = rem > PGSIZE ? PGSIZE : rem;
+        }
+        if (n > 0) {
+          (void) writei(v->f->ip, 0, (uint64)pa, file_off, n);
+        }
+        iunlock(v->f->ip);
+        end_op();
+      }
+      kfree((void *)pa);
+      *pte = 0;
+    }
+  }
+  return 0;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 uaddr;
+  size_t length;
+  struct proc *p = myproc();
+
+  argaddr(0, &uaddr);
+  argaddr(1, (uint64 *)&length);
+  if (length == 0)
+    return -1;
+  if (uaddr % PGSIZE)
+    return -1;
+  length = PGROUNDUP(length);
+
+  struct vma *v = find_vma_covering(p, uaddr, length);
+  if (v == 0)
+    return -1;
+
+  // unmap and optional writeback
+  vma_writeback_and_unmap(p, v, uaddr, length);
+
+  // adjust vma (support unmap from head or tail; not middle)
+  if (uaddr == v->start && length == v->length) {
+    // remove whole VMA
+    if (v->f) {
+      fileclose(v->f);
+      v->f = 0;
+    }
+    v->used = 0;
+  } else if (uaddr == v->start) {
+    v->start += length;
+    v->off += length;
+    v->length -= length;
+  } else if (uaddr + length == v->start + v->length) {
+    v->length -= length;
+  } else {
+    // unsupported split
+    return -1;
+  }
+
+  return 0;
+}
+#endif
+
+#ifdef LAB_MMAP
+void
+vma_cleanup(struct proc *p)
+{
+  for (int i = 0; i < MAXVMA; i++) {
+    if (!p->vmas[i].used)
+      continue;
+    struct vma *v = &p->vmas[i];
+    // unmap whole region with writeback if needed
+    vma_writeback_and_unmap(p, v, v->start, v->length);
+    if (v->f) {
+      fileclose(v->f);
+      v->f = 0;
+    }
+    v->used = 0;
+  }
+}
+#endif
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
 static int
@@ -503,3 +738,4 @@ sys_pipe(void)
   }
   return 0;
 }
+

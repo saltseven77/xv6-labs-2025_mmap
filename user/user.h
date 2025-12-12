@@ -3,6 +3,11 @@ typedef unsigned long size_t;
 typedef long int off_t;
 #endif
 
+#ifdef LAB_MMAP
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+int munmap(void *addr, size_t length);
+#endif
+
 #define SBRK_ERROR ((char *)-1)
 
 struct stat;

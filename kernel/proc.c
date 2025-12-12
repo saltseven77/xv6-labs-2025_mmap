@@ -145,7 +145,18 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
-
+#ifdef LAB_MMAP
+  // init VMA table
+  for (int i = 0; i < MAXVMA; i++) {
+    p->vmas[i].used = 0;
+    p->vmas[i].start = 0;
+    p->vmas[i].length = 0;
+    p->vmas[i].prot = 0;
+    p->vmas[i].flags = 0;
+    p->vmas[i].f = 0;
+    p->vmas[i].off = 0;
+  }
+#endif
   return p;
 }
 
@@ -284,7 +295,19 @@ kfork(void)
     if(p->ofile[i])
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
-
+#ifdef LAB_MMAP
+  // duplicate VMA metadata and hold file refs
+  for (i = 0; i < MAXVMA; i++) {
+    if (p->vmas[i].used) {
+      np->vmas[i] = p->vmas[i];
+      if (np->vmas[i].f)
+        np->vmas[i].f = filedup(np->vmas[i].f);
+    } else {
+      np->vmas[i].used = 0;
+      np->vmas[i].f = 0;
+    }
+  }
+#endif
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -327,7 +350,10 @@ kexit(int status)
 
   if(p == initproc)
     panic("init exiting");
-
+  // Clean up mmaps before files are closed.
+#ifdef LAB_MMAP
+  vma_cleanup(p);
+#endif
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
     if(p->ofile[fd]){
